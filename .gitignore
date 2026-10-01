@@ -7,3 +7,6 @@ __pycache__/
 # Local settings and scheduled-run logs
 config.json
 logs/
+
+# Dashboard CSV exports (may contain real device data)
+exports/

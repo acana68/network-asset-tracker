@@ -1,2 +1,4 @@
 scapy>=2.5
 mac-vendor-lookup>=0.1.12
+streamlit>=1.50
+pandas>=2.0

@@ -1,0 +1,10 @@
+# Dashboard theme: the same accent blue as the charts, so widgets and
+# progress bars match. Light and dark still follow the system setting.
+[theme.light]
+primaryColor = "#2a78d6"
+
+[theme.dark]
+primaryColor = "#3987e5"
+
+[browser]
+gatherUsageStats = false

@@ -24,6 +24,10 @@ All screenshots use the built-in demo data (`python -m tracker demo`), so the de
 
 ![Report output](screenshots/report.png)
 
+**Dashboard:** KPIs, devices online over time, device mix, new devices per day, an hourly activity heatmap, and a searchable device table, in a Streamlit app.
+
+![Dashboard](screenshots/dashboard.png)
+
 ## What it does
 
 - **Discovers devices** with an ARP sweep of the subnet (catches devices that ignore ping)
@@ -33,6 +37,7 @@ All screenshots use the built-in demo data (`python -m tracker demo`), so the de
 - **Tracks history over time**: first seen, last seen, and every IP a device has used
 - **Flags new devices** after each scan, and lets you mark known ones as trusted
 - **Runs unattended**: scheduled scans, a log file, and Discord alerts for new devices
+- **Dashboard**: a Streamlit app with device trends, an hourly activity heatmap, and CSV export for Power BI or Excel
 
 ## Skills demonstrated
 
@@ -42,6 +47,7 @@ All screenshots use the built-in demo data (`python -m tracker demo`), so the de
 - **scapy**: crafting and sending raw ARP packets
 - **Windows Task Scheduler**: unattended scans every 30 minutes, set up by a PowerShell script
 - **Webhook integration**: Discord alerts for new devices, with the URL kept out of the code
+- **Data visualization**: a Streamlit, pandas, and Altair dashboard that reads the database read-only
 - **IoT device identification**: OUI vendor lookup, randomized-MAC detection, and spotting smart home devices by their Wi-Fi module maker
 
 ## Setup
@@ -183,6 +189,35 @@ Get-Content logs\scan.log -Wait -Tail 10    # follow live
 
 You can log manual runs too: `python -m tracker --log logs\scan.log scan`.
 
+## Dashboard (Phase 3)
+
+A Streamlit dashboard for browsing the scan history. From the project folder:
+
+```bash
+pip install -r requirements.txt
+streamlit run dashboard/app.py
+```
+
+It opens in your browser at http://localhost:8501. Pick the database in the sidebar: `demo.db` (the default, fake devices from `python -m tracker demo`) or `assets.db` (your real scans). The database is opened **read-only**, so the dashboard can't change it, even while a scheduled scan is running.
+
+What's on it:
+
+- **KPI cards**: devices tracked, currently online (answered the most recent scan), untrusted devices, and new devices in the 24 hours before the last scan
+- **Devices online over time**: one point per scan run, with all subnets combined
+- **Device mix by type**: every device ever seen, by type
+- **Device activity by hour**: a heatmap of hour of day vs. device, showing how often each device answered scans at that hour
+- **New devices over time**: devices by the day they were first seen. Devices found by the very first scan run are left out as a baseline, since every device is "new" on the first scan.
+- **Device table**: nickname or vendor, MAC, type, last IP, trusted, first and last seen, and uptime (the % of scan runs since the device was first seen in which it answered). Search by name, vendor, MAC, or IP, and filter by type or trust.
+
+A "scan run" is one round of scans: each subnet gets its own row in the `scans` table, so scans of different subnets that run back to back are grouped together.
+
+**Export CSV** (in the sidebar) writes two files for Power BI or Excel:
+
+- `exports/devices.csv`: one row per device, with uptime and online status
+- `exports/sightings.csv`: one row per device per scan, with IP, subnet, and timestamp
+
+The `exports/` folder is gitignored, since exports of `assets.db` contain your real MAC addresses.
+
 ## How it works
 
 1. **ARP sweep.** The scanner broadcasts "who has this IP?" for every address in the subnet. Every live device has to answer to stay on the network, so it replies with its MAC address.
@@ -216,7 +251,7 @@ Running this on my own home network turned up a few things:
 - [x] Alerts for new devices (Discord webhook)
 - [x] Scheduled scans (Windows Task Scheduler)
 - [ ] Mark devices offline when they haven't been seen in N hours
-- [ ] Dashboard: device counts by type, uptime patterns, new devices over time
+- [x] Dashboard: device counts by type, uptime patterns, new devices over time
 
 ## Responsible use
 
