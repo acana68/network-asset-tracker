@@ -1,0 +1,9 @@
+# Your scan data contains your devices' MAC addresses - don't publish it
+*.db
+__pycache__/
+*.pyc
+.venv/
+
+# Local settings and scheduled-run logs
+config.json
+logs/
