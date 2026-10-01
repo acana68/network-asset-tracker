@@ -3,8 +3,11 @@
 Usage:
     python -m tracker scan                # scan your network, flag new devices
     python -m tracker scan --subnet 192.168.1.0/24 192.168.4.0/22
-    python -m tracker list                # show every device ever seen
+    python -m tracker list                # every device ever seen, online/offline
     python -m tracker trust <mac> --name "Work laptop"
+    python -m tracker watch <mac>         # alert when it goes offline / comes back
+    python -m tracker unwatch <mac>
+    python -m tracker list --offline-after 4     # offline = not seen in 4 hours
     python -m tracker report              # summary stats
     python -m tracker update-vendors      # refresh the manufacturer database
     python -m tracker test-alert          # send a test Discord message
@@ -17,7 +20,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import alerts, config, db, demo
+from . import alerts, config, db, demo, status
 from .classify import classify
 
 MAX_LOG_BYTES = 1_000_000  # rotate to scan.log.1 past ~1 MB
@@ -57,6 +60,8 @@ def cmd_scan(args):
     from .scanner import arp_scan, gateway_ip, guess_subnet, lookup_hostname, own_macs
 
     conn = db.connect(args.db)
+    cfg = config.load(args.config)
+    hours = status.offline_hours(cfg, args.offline_after)
 
     if demo.is_demo(conn):
         # Never mix real devices into a demo database: replay fake ones instead
@@ -65,7 +70,6 @@ def cmd_scan(args):
         def discover(subnet):
             return demo.fake_scan(conn, subnet)
     else:
-        cfg = config.load(args.config)
         subnets = args.subnet or cfg.get("subnets") or [guess_subnet()]
         timeout = args.timeout if args.timeout is not None else cfg.get("timeout", 2)
         my_macs = own_macs()
@@ -80,7 +84,12 @@ def cmd_scan(args):
                                     is_self=dev["mac"] in my_macs))
             return results
 
-    new_devices = []
+    run_scans(conn, subnets, discover, hours)
+
+
+def run_scans(conn, subnets, discover, hours):
+    """Scan each subnet with discover(subnet), update statuses, and send alerts."""
+    new_devices, unreliable = [], []
     for subnet in subnets:
         print(f"Scanning {subnet} ...")
 
@@ -91,8 +100,15 @@ def cmd_scan(args):
             if db.record_device(conn, scan_id, dev):
                 new_devices.append(dev)
 
-        db.finish_scan(conn, scan_id, len(results))
+        started = conn.execute("SELECT started_at FROM scans WHERE id = ?", (scan_id,)).fetchone()[0]
+        reliable, typical = db.scan_is_reliable(conn, subnet, scan_id, started, len(results))
+        db.finish_scan(conn, scan_id, len(results), reliable)
         print(f"Found {len(results)} devices on {subnet}.")
+        if not reliable:
+            print(f"WARNING: {subnet} usually has ~{round(typical)} devices, so this scan looks "
+                  "unreliable. No device on this subnet will be marked offline.", file=sys.stderr)
+            if db.quality_alert_due(conn, subnet):
+                unreliable.append((scan_id, subnet, len(results), typical))
 
     if new_devices:
         print(f"\n[!] {len(new_devices)} NEW device(s):")
@@ -102,12 +118,38 @@ def cmd_scan(args):
     else:
         print("No new devices.")
 
+    # Watched devices that went offline or came back since the last scan
+    changes = status.refresh(conn, hours)
+    if changes:
+        print("\n[!] Watched device status changed:")
+        for c in changes:
+            print("  " + alerts.status_line(c))
+
     # New devices are always untrusted, since trust is set by hand afterwards
     try:
         if alerts.send_new_devices(new_devices):
             print("Sent Discord alert.")
     except alerts.AlertError as e:
         print(f"Discord alert failed: {e}", file=sys.stderr)
+
+    # One alert per unreliable stretch; retried next scan if it couldn't be sent
+    for scan_id, subnet, found, typical in unreliable:
+        try:
+            if alerts.send_unreliable_scan(subnet, found, typical):
+                db.mark_quality_alert(conn, scan_id)
+                print(f"Sent Discord alert about the scan of {subnet}.")
+        except alerts.AlertError as e:
+            print(f"Discord alert failed: {e}", file=sys.stderr)
+
+    # Statuses are saved only once the alert went out (or there's no webhook to send
+    # it to), so a failed alert is retried on the next scan instead of being lost
+    if changes:
+        try:
+            if alerts.send_status_changes(changes):
+                print("Sent Discord alert for watched devices.")
+            status.save(conn, changes)
+        except alerts.AlertError as e:
+            print(f"Discord alert failed: {e}. It will be retried on the next scan.", file=sys.stderr)
 
 
 def cmd_test_alert(args):
@@ -122,6 +164,9 @@ def cmd_test_alert(args):
             devices = demo.alert_devices(conn)
     if devices:
         messages = alerts.format_devices(devices)
+        offline = demo.status_alert_sample(conn)
+        if offline:
+            messages += alerts.format_status_changes(offline)
     else:
         messages = ["Test alert from the network asset tracker. Alerts are working."]
     try:
@@ -148,12 +193,54 @@ def cmd_list(args):
     if not rows:
         print("No devices yet. Run a scan first.")
         return
-    print(f"{'MAC':<18} {'LAST IP':<15} {'NAME / VENDOR':<28} {'TYPE':<36} {'TRUSTED':<8} LAST SEEN")
+    hours = status.offline_hours(config.load(args.config), args.offline_after)
+    statuses = status.device_statuses(conn, hours)
+    print(f"{'MAC':<18} {'LAST IP':<15} {'NAME / VENDOR':<28} {'TYPE':<34} "
+          f"{'TRUSTED':<8} {'WATCHED':<8} {'STATUS':<8} LAST SEEN")
     for r in rows:
         label = r["nickname"] or r["vendor"] or r["hostname"] or "-"
         trusted = "yes" if r["trusted"] else "NO"
+        watched = "*" if r["watched"] else ""
+        state = {status.ONLINE: "online", status.OFFLINE: "OFFLINE"}.get(statuses.get(r["id"]), "-")
         print(f"{r['mac']:<18} {r['last_ip'] or '-':<15} {label[:27]:<28} "
-              f"{r['device_type'][:35]:<36}{trusted:<8} {r['last_seen']}")
+              f"{(r['device_type'] or '-')[:33]:<34} {trusted:<8} {watched:<8} {state:<8} "
+              f"{r['last_seen']}")
+    print(f"\nOFFLINE = not seen in the {hours:g} hours before its subnet's latest scan.  "
+          f"* = watched")
+
+
+def _device_name(conn, mac):
+    row = conn.execute("SELECT nickname, vendor, hostname FROM devices WHERE mac = ?",
+                       (mac.lower(),)).fetchone()
+    return row and (row["nickname"] or row["vendor"] or row["hostname"] or mac)
+
+
+def cmd_watch(args):
+    conn = db.connect(args.db)
+    name = _device_name(conn, args.mac)
+    if name is None:
+        print(f"No device with MAC {args.mac} found.")
+        sys.exit(1)
+    # Store its current status before watching, so an existing condition doesn't alert
+    hours = status.offline_hours(config.load(args.config), args.offline_after)
+    status.refresh(conn, hours)
+    db.set_watched(conn, args.mac, True)
+    device_id = conn.execute("SELECT id FROM devices WHERE mac = ?", (args.mac.lower(),)).fetchone()[0]
+    now = status.device_statuses(conn, hours).get(device_id)
+    print(f"Watching {name} ({args.mac.lower()}): currently {now or 'unknown'}.")
+    print("You'll get a Discord alert when it goes offline or comes back online.")
+    if not alerts.webhook_url():
+        print(f"Note: {alerts.ENV_VAR} isn't set, so no alerts will actually be sent.")
+
+
+def cmd_unwatch(args):
+    conn = db.connect(args.db)
+    name = _device_name(conn, args.mac)
+    if name is None:
+        print(f"No device with MAC {args.mac} found.")
+        sys.exit(1)
+    db.set_watched(conn, args.mac, False)
+    print(f"Stopped watching {name} ({args.mac.lower()}).")
 
 
 def cmd_trust(args):
@@ -199,6 +286,12 @@ def cmd_update_vendors(args):
     print("Done.")
 
 
+def add_offline_after(parser):
+    parser.add_argument("--offline-after", type=float, metavar="HOURS",
+                        help="Offline = not seen in this many hours before the subnet's "
+                             f"latest scan (default: from config.json, else {status.DEFAULT_HOURS})")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="tracker", description="Network asset tracker")
     parser.add_argument("--db", default="assets.db", help="SQLite database file")
@@ -213,9 +306,21 @@ def main():
     p.add_argument("--timeout", type=int,
                    help="Seconds to wait for replies (default: from config.json, else 2)")
     p.add_argument("--no-hostnames", action="store_true", help="Skip reverse DNS (faster)")
+    add_offline_after(p)
     p.set_defaults(func=cmd_scan)
 
-    sub.add_parser("list", help="List all known devices").set_defaults(func=cmd_list)
+    p = sub.add_parser("list", help="List all known devices")
+    add_offline_after(p)
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("watch", help="Alert when this device goes offline or comes back")
+    p.add_argument("mac")
+    add_offline_after(p)
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("unwatch", help="Stop alerting about this device")
+    p.add_argument("mac")
+    p.set_defaults(func=cmd_unwatch)
 
     p = sub.add_parser("trust", help="Mark a device as known")
     p.add_argument("mac")

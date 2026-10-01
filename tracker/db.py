@@ -4,10 +4,22 @@ Three tables:
   devices   - one row per unique MAC address (the "asset")
   scans     - one row per scan run
   sightings - one row per device seen in a scan (gives you history over time)
+
+Databases from older versions are upgraded in place by connect().
 """
 
 import sqlite3
-from datetime import datetime
+import statistics
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+# Data-quality guard: a scan finding less than half the usual number of devices
+# is unreliable. "Usual" is the median of the subnet's reliable scans in the
+# previous day; with fewer than MIN_HISTORY of them, or a usual count below
+# MIN_TYPICAL, every scan counts as reliable.
+HISTORY = timedelta(hours=24)
+MIN_HISTORY = 3
+MIN_TYPICAL = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -20,7 +32,10 @@ CREATE TABLE IF NOT EXISTS devices (
     nickname      TEXT,
     trusted       INTEGER NOT NULL DEFAULT 0,
     first_seen    TEXT NOT NULL,
-    last_seen     TEXT NOT NULL
+    last_seen     TEXT NOT NULL,
+    watched       INTEGER NOT NULL DEFAULT 0,  -- alert when it goes offline / comes back
+    status        TEXT,                        -- last stored 'online' / 'offline'
+    status_changed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS scans (
@@ -28,7 +43,9 @@ CREATE TABLE IF NOT EXISTS scans (
     started_at    TEXT NOT NULL,
     finished_at   TEXT,
     subnet        TEXT NOT NULL,
-    devices_found INTEGER
+    devices_found INTEGER,
+    reliable      INTEGER,                     -- 0 = found far fewer devices than usual
+    quality_alert INTEGER NOT NULL DEFAULT 0   -- 1 = a Discord alert was sent about it
 );
 
 CREATE TABLE IF NOT EXISTS sightings (
@@ -52,7 +69,35 @@ def connect(path="assets.db"):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    _upgrade(conn)
     return conn
+
+
+def columns(conn, table):
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _upgrade(conn):
+    """Add columns that older databases don't have yet."""
+    have = columns(conn, "devices")
+    for col, ddl in [("watched", "INTEGER NOT NULL DEFAULT 0"),
+                     ("status", "TEXT"), ("status_changed_at", "TEXT")]:
+        if col not in have:
+            conn.execute(f"ALTER TABLE devices ADD COLUMN {col} {ddl}")
+    have = columns(conn, "scans")
+    if "quality_alert" not in have:
+        conn.execute("ALTER TABLE scans ADD COLUMN quality_alert INTEGER NOT NULL DEFAULT 0")
+    if "reliable" not in have:
+        conn.execute("ALTER TABLE scans ADD COLUMN reliable INTEGER")
+        # Judge existing scans by the same rule, so an ongoing outage isn't
+        # mistaken for the new normal
+        flags = judge_scans(conn.execute(
+            "SELECT id, subnet, started_at, devices_found FROM scans "
+            "WHERE finished_at IS NOT NULL ORDER BY id"
+        ).fetchall())
+        conn.executemany("UPDATE scans SET reliable = ? WHERE id = ?",
+                         [(int(ok), scan_id) for scan_id, ok in flags.items()])
+    conn.commit()
 
 
 def start_scan(conn, subnet):
@@ -63,11 +108,63 @@ def start_scan(conn, subnet):
     return cur.lastrowid
 
 
-def finish_scan(conn, scan_id, devices_found):
+def finish_scan(conn, scan_id, devices_found, reliable=True):
     conn.execute(
-        "UPDATE scans SET finished_at = ?, devices_found = ? WHERE id = ?",
-        (now(), devices_found, scan_id),
+        "UPDATE scans SET finished_at = ?, devices_found = ?, reliable = ? WHERE id = ?",
+        (now(), devices_found, int(reliable), scan_id),
     )
+    conn.commit()
+
+
+def _judge(found, recent):
+    """(reliable, typical) for a scan, given the counts of the subnet's recent reliable scans."""
+    if len(recent) < MIN_HISTORY:
+        return True, None
+    typical = statistics.median(recent)
+    if typical < MIN_TYPICAL:
+        return True, typical
+    return found >= typical / 2, typical
+
+
+def scan_is_reliable(conn, subnet, scan_id, started_at, devices_found):
+    """Returns (reliable, typical count or None) for a scan that just finished."""
+    since = (datetime.fromisoformat(started_at) - HISTORY).isoformat(timespec="seconds")
+    recent = [r[0] for r in conn.execute(
+        """SELECT devices_found FROM scans
+           WHERE subnet = ? AND id < ? AND started_at >= ? AND finished_at IS NOT NULL
+                 AND COALESCE(reliable, 1) = 1""",
+        (subnet, scan_id, since),
+    )]
+    return _judge(devices_found, recent)
+
+
+def judge_scans(scans):
+    """{scan id: reliable} for (id, subnet, started_at, devices_found) rows, oldest first.
+
+    The same rule as scan_is_reliable, worked out in memory: used to upgrade old
+    databases, and by the read-only dashboard before a database is upgraded.
+    """
+    history, flags = defaultdict(list), {}
+    for scan_id, subnet, started_at, found in scans:
+        started = datetime.fromisoformat(started_at)
+        recent = [n for t, n in history[subnet] if t >= started - HISTORY]
+        flags[scan_id] = _judge(found, recent)[0]
+        if flags[scan_id]:
+            history[subnet].append((started, found))
+    return flags
+
+
+def quality_alert_due(conn, subnet):
+    """True unless an alert was already sent since the subnet's last reliable scan."""
+    return conn.execute(
+        """SELECT 1 FROM scans WHERE subnet = ? AND quality_alert = 1 AND id >
+               COALESCE((SELECT MAX(id) FROM scans WHERE subnet = ? AND reliable = 1), 0)""",
+        (subnet, subnet),
+    ).fetchone() is None
+
+
+def mark_quality_alert(conn, scan_id):
+    conn.execute("UPDATE scans SET quality_alert = 1 WHERE id = ?", (scan_id,))
     conn.commit()
 
 
@@ -113,6 +210,12 @@ def record_device(conn, scan_id, dev):
     )
     conn.commit()
     return is_new
+
+
+def set_watched(conn, mac, watched):
+    cur = conn.execute("UPDATE devices SET watched = ? WHERE mac = ?", (int(watched), mac.lower()))
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def set_trusted(conn, mac, nickname=None):

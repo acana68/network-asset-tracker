@@ -2,7 +2,8 @@
 
 config.json (next to assets.db) looks like:
 
-    {"subnets": ["192.168.1.0/24", "192.168.4.0/22"], "timeout": 2}
+    {"subnets": ["192.168.1.0/24", "192.168.4.0/22"], "timeout": 2,
+     "offline_after_hours": 2}
 
 Every key is optional, and command-line arguments always win over the file.
 """

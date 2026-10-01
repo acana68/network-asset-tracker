@@ -4,10 +4,12 @@
     python -m tracker --db demo.db scan           # simulated scan, no packets sent
     python -m tracker --db demo.db list
     python -m tracker --db demo.db report
-    python -m tracker --db demo.db test-alert     # Discord alert listing demo devices
+    python -m tracker --db demo.db test-alert     # sample Discord alerts with demo devices
 
 The MACs are made up, but start with real vendor prefixes (OUIs), so they get
-the same vendor names and device types a real scan would give them.
+the same vendor names and device types a real scan would give them. Three
+devices are watched, and one of them (the front doorbell) dropped off the
+network a few hours before the last scan, so it shows as offline.
 
 A demo database is marked with a demo_info table. `scan` never does a real
 ARP sweep into a marked database, and `demo` refuses to overwrite anything
@@ -20,7 +22,7 @@ import random
 import sqlite3
 from datetime import datetime, timedelta
 
-from . import db
+from . import db, status
 from .classify import guess_type, is_random_mac
 from .scanner import gateway_ip
 
@@ -37,28 +39,29 @@ THIS_COMPUTER = "f8:94:c2:3a:71:5e"
 
 # Vendor strings are exactly what mac_vendor_lookup returns for each prefix.
 # nickname = trusted. presence = chance of answering any one scan.
-# window = (first, last) days ago the device was around.
+# window = (first, last) days ago the device was around. watched = alert on offline/online.
 DEVICES = [
     # 192.168.1.0/24
     dict(mac="f8:bb:bf:4e:29:30", ip="192.168.1.1", vendor="eero inc.",
          nickname="Mesh router (WAN side)"),
     dict(mac="3c:52:82:9d:14:c6", ip="192.168.1.23", vendor="Hewlett Packard",
-         hostname="HP9D14C6", nickname="Office printer"),
+         hostname="HP9D14C6", nickname="Office printer", watched=True),
     dict(mac="8c:79:f5:62:b0:1d", ip="192.168.1.40", vendor="Samsung Electronics Co.,Ltd",
          hostname="Samsung-TV", nickname="Living room TV", presence=0.85),
     dict(mac="24:0a:c4:7e:58:93", ip="192.168.1.57", vendor="Espressif Inc.",
          window=(2, 0)),
     # 192.168.4.0/22
     dict(mac="f8:bb:bf:4e:29:31", ip="192.168.4.1", vendor="eero inc.",
-         nickname="Mesh router"),
+         nickname="Mesh router", watched=True),
     dict(mac=THIS_COMPUTER, ip="192.168.4.12", vendor="Intel Corporate",
          hostname="DESKTOP-OFFICE", nickname="Office desktop"),
     dict(mac="f0:18:98:c4:2e:7a", ip="192.168.4.20", vendor="Apple, Inc.",
          hostname="MacBook-Air", nickname="Work laptop", presence=0.7),
     dict(mac="88:66:5a:1f:d3:08", ip="192.168.4.31", vendor="Apple, Inc.",
          hostname="iPad", nickname="Kitchen iPad", presence=0.6),
+    # Offline for the last 3.5 hours (the default threshold is 2)
     dict(mac="34:3e:a4:b8:06:5f", ip="192.168.4.44", vendor="Ring LLC",
-         nickname="Front doorbell"),
+         nickname="Front doorbell", watched=True, window=(3, 3.5 / 24)),
     dict(mac="90:48:6c:2d:9a:e4", ip="192.168.4.45", vendor="Ring LLC",
          presence=0.95),
     dict(mac="5c:49:7d:a3:61:bc", ip="192.168.4.52", vendor="Samsung Electronics Co.,Ltd",
@@ -138,10 +141,11 @@ def build(path=DEFAULT_PATH):
         dev = _classified(spec)
         cur = conn.execute(
             """INSERT INTO devices (mac, vendor, device_type, hostname, is_random_mac,
-                                    nickname, trusted, first_seen, last_seen)
-               VALUES (?, ?, ?, ?, ?, ?, ?, '', '')""",
+                                    nickname, trusted, watched, first_seen, last_seen)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '')""",
             (dev["mac"], dev["vendor"], dev["device_type"], dev["hostname"],
-             int(dev["is_random_mac"]), spec.get("nickname"), int(bool(spec.get("nickname")))),
+             int(dev["is_random_mac"]), spec.get("nickname"), int(bool(spec.get("nickname"))),
+             int(spec.get("watched", False))),
         )
         devices.append((cur.lastrowid, spec, _subnet_of(spec["ip"])))
 
@@ -160,7 +164,8 @@ def build(path=DEFAULT_PATH):
                         and rng.random() < spec.get("presence", 1.0)):
                     seen.append((device_id, spec["ip"]))
             cur = conn.execute(
-                "INSERT INTO scans (started_at, finished_at, subnet, devices_found) VALUES (?, ?, ?, ?)",
+                "INSERT INTO scans (started_at, finished_at, subnet, devices_found, reliable) "
+                "VALUES (?, ?, ?, ?, 1)",
                 (ts(started), ts(started + timedelta(seconds=rng.randint(3, 6))), subnet, len(seen)),
             )
             conn.executemany(
@@ -177,6 +182,7 @@ def build(path=DEFAULT_PATH):
                last_seen  = (SELECT MAX(seen_at) FROM sightings WHERE device_id = devices.id)"""
     )
     conn.commit()
+    status.refresh(conn, status.DEFAULT_HOURS)  # first statuses are stored without alerts
     conn.close()
     return len(devices), scans
 
@@ -203,3 +209,15 @@ def alert_devices(conn, limit=3):
     rows.sort(key=lambda r: r["first_seen"], reverse=True)
     return [{"mac": r["mac"], "ip": r["last_ip"], "vendor": r["vendor"],
              "device_type": r["device_type"]} for r in rows[:limit]]
+
+
+def status_alert_sample(conn):
+    """Watched devices that are offline, shaped like status.refresh() changes."""
+    rows = conn.execute(
+        """SELECT d.*, (SELECT ip FROM sightings s WHERE s.device_id = d.id
+                         ORDER BY s.id DESC LIMIT 1) AS last_ip
+           FROM devices d WHERE watched = 1 AND status = ?""", (status.OFFLINE,)
+    ).fetchall()
+    return [{"id": r["id"], "mac": r["mac"], "status": status.OFFLINE, "ip": r["last_ip"],
+             "name": r["nickname"] or r["vendor"] or r["mac"], "last_seen": r["last_seen"],
+             "gap": None} for r in rows]

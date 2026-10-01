@@ -9,10 +9,12 @@ exports/sightings.csv for Power BI or Excel.
 
 Each subnet gets its own row in `scans`, so scans of different subnets that
 run back to back are grouped into one "run". Online counts, uptime, and the
-heatmap are all per run.
+heatmap are all per run. Online/offline status uses the same rule as the
+`list` command (tracker/status.py).
 """
 
 import sqlite3
+import sys
 from contextlib import closing
 from datetime import timedelta
 from pathlib import Path
@@ -22,6 +24,9 @@ import pandas as pd
 import streamlit as st
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_DIR))
+from tracker import config as tracker_config, status as tracker_status  # noqa: E402
+
 DATABASES = ["demo.db", "assets.db"]
 EXPORT_DIR = PROJECT_DIR / "exports"
 
@@ -47,13 +52,26 @@ def connect_readonly(path):
     return sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
 
 
+def default_offline_hours():
+    path = PROJECT_DIR / tracker_config.DEFAULT_PATH
+    try:
+        return tracker_status.offline_hours(tracker_config.load(str(path)) if path.exists() else {})
+    except SystemExit:  # unreadable config.json: the CLI reports it, the dashboard just uses the default
+        return float(tracker_status.DEFAULT_HOURS)
+
+
 @st.cache_data(show_spinner=False)
-def load(path_str, mtime):
-    """Raw tables. `mtime` is part of the cache key, so new scans show up on rerun."""
+def load(path_str, mtime, offline_hours):
+    """Raw tables plus each device's status. `mtime` is part of the cache key, so new
+    scans show up on rerun."""
     with closing(connect_readonly(Path(path_str))) as conn:
         devices = pd.read_sql_query("SELECT * FROM devices", conn)
         scans = pd.read_sql_query("SELECT * FROM scans ORDER BY started_at, id", conn)
         sightings = pd.read_sql_query("SELECT * FROM sightings ORDER BY id", conn)
+        statuses = tracker_status.device_statuses(conn, offline_hours)
+    devices["status"] = devices.id.map(statuses)
+    if "watched" not in devices:  # a database the scanner hasn't upgraded yet
+        devices["watched"] = 0
     for df, cols in [(devices, ["first_seen", "last_seen"]),
                      (scans, ["started_at", "finished_at"]),
                      (sightings, ["seen_at"])]:
@@ -107,13 +125,14 @@ def build_model(devices, scans, sightings):
     d["name"], d["label"] = display_names(d)
     d["device_type"] = d.device_type.fillna("Unknown")
     d["trusted"] = d.trusted.astype(bool)
+    d["watched"] = d.watched.astype(bool)
     d["last_ip"] = d.id.map(sightings.groupby("device_id").ip.last())
     first_run = seen.groupby("device_id").run.min()
     d["first_run"] = d.id.map(first_run)
     d["runs_seen"] = d.id.map(seen.groupby("device_id").run.nunique()).fillna(0).astype(int)
     d["runs_since_first"] = d.id.map(last_run - first_run + 1)
     d["uptime"] = d.runs_seen / d.runs_since_first
-    d["online"] = d.id.isin(seen.loc[seen.run == last_run, "device_id"])
+    d["in_last_run"] = d.id.isin(seen.loc[seen.run == last_run, "device_id"])
 
     online = (runs[["run", "started"]]
               .merge(seen.groupby("run").device_id.nunique().rename("online").reset_index(),
@@ -217,8 +236,9 @@ def heatmap(heat, d, t):
 def export_csv(d, sightings, scans):
     EXPORT_DIR.mkdir(exist_ok=True)
     devices_out = d[["mac", "name", "nickname", "vendor", "hostname", "device_type",
-                     "is_random_mac", "trusted", "online", "last_ip", "first_seen",
-                     "last_seen", "runs_seen", "runs_since_first"]].copy()
+                     "is_random_mac", "trusted", "watched", "status", "in_last_run",
+                     "last_ip", "first_seen", "last_seen", "runs_seen",
+                     "runs_since_first"]].copy()
     devices_out["uptime_pct"] = (d.uptime * 100).round(1)
     sightings_out = (sightings
                      .merge(scans[["id", "subnet"]], left_on="scan_id", right_on="id",
@@ -248,6 +268,10 @@ with st.sidebar:
                             "assets.db is your real scan history.")
     db_path = PROJECT_DIR / db_name
     st.caption("Opened read-only: the dashboard never writes to the database.")
+    offline_hours = st.number_input(
+        "Offline after (hours)", min_value=0.25, step=0.5, value=default_offline_hours(),
+        help="A device is offline if it wasn't seen in this many hours before its subnet's "
+             "latest reliable scan. The default comes from offline_after_hours in config.json.")
 
 st.title("Network Asset Tracker")
 
@@ -257,7 +281,7 @@ if not db_path.exists():
     st.stop()
 
 try:
-    devices, scans, sightings = load(str(db_path), db_path.stat().st_mtime)
+    devices, scans, sightings = load(str(db_path), db_path.stat().st_mtime, offline_hours)
 except sqlite3.Error as e:
     st.error(f"Couldn't read {db_name}: {e}")
     st.stop()
@@ -281,14 +305,19 @@ st.caption(f"{db_name} · last scan {last_scan:%b %d, %H:%M} · "
 
 # KPI cards
 new_24h = (d.first_seen > last_scan - timedelta(hours=24)).sum()
-k1, k2, k3, k4 = st.columns(4)
+watched_offline = d[d.watched & (d.status == tracker_status.OFFLINE)]
+k1, k2, k3, k4, k5 = st.columns([0.8, 0.9, 0.95, 1.05, 1.15])  # sized to the labels
 k1.metric("Devices tracked", len(d), border=True)
-k2.metric("Currently online", int(d.online.sum()), border=True,
+k2.metric("Currently online", int(d.in_last_run.sum()), border=True,
           help="Devices that answered the most recent scan run.")
 k3.metric("Untrusted devices", int((~d.trusted).sum()), border=True,
           help="Devices nobody has marked trusted with `python -m tracker trust`.")
 k4.metric("New in last 24 hours", int(new_24h), border=True,
           help="First seen in the 24 hours before the last scan.")
+k5.metric("Watched devices offline", f"{len(watched_offline)} of {int(d.watched.sum())}",
+          border=True,
+          help=f"Watched devices not seen in the {offline_hours:g} hours before their subnet's "
+               "latest scan" + (": " + ", ".join(watched_offline.name) if len(watched_offline) else "."))
 
 st.subheader("Devices online over time")
 st.caption("One point per scan run, all subnets combined.")
@@ -326,24 +355,32 @@ if types:
 if trust != "All":
     table = table[table.trusted == (trust == "Trusted")]
 
+STATUS_LABELS = {tracker_status.ONLINE: "🟢 Online", tracker_status.OFFLINE: "🔴 Offline"}
 st.dataframe(
-    table[["name", "mac", "device_type", "last_ip", "trusted", "first_seen", "last_seen",
-           "uptime"]].assign(uptime=table.uptime * 100),
+    table[["name", "status", "watched", "mac", "device_type", "last_ip", "trusted", "first_seen",
+           "last_seen", "uptime"]]
+    .assign(uptime=table.uptime * 100, status=table.status.map(STATUS_LABELS).fillna("–")),
     hide_index=True,
     height=min(len(table) + 1, 21) * 35 + 3,  # every row up to 20, then scroll
     column_config={
         # Widths fit a laptop screen without sideways scrolling
-        "name": st.column_config.TextColumn("Nickname / vendor", width=160),
-        "mac": st.column_config.TextColumn("MAC", width=125),
-        "device_type": st.column_config.TextColumn("Type", width=190),
-        "last_ip": st.column_config.TextColumn("Last IP", width=100),
+        "name": st.column_config.TextColumn("Nickname / vendor", width=135),
+        "status": st.column_config.TextColumn(
+            "Status", width=85,
+            help=f"Offline = not seen in the {offline_hours:g} hours before its subnet's "
+                 "latest reliable scan."),
+        "watched": st.column_config.CheckboxColumn(
+            "Watched", width=65, help="Alerts when it goes offline or comes back "
+                                      "(`python -m tracker watch <mac>`)."),
+        "mac": st.column_config.TextColumn("MAC", width=120),
+        "device_type": st.column_config.TextColumn("Type", width=125),
+        "last_ip": st.column_config.TextColumn("Last IP", width=95),
         "trusted": st.column_config.CheckboxColumn("Trusted", width=60),
-        "first_seen": st.column_config.DatetimeColumn("First seen", format="MMM D, HH:mm",
-                                                      width=105),
+        "first_seen": st.column_config.DatetimeColumn("First seen", format="MMM D", width=70),
         "last_seen": st.column_config.DatetimeColumn("Last seen", format="MMM D, HH:mm",
-                                                     width=105),
+                                                     width=95),
         "uptime": st.column_config.ProgressColumn(
-            "Uptime", min_value=0, max_value=100, format="%.0f%%", width=95,
+            "Uptime", min_value=0, max_value=100, format="%.0f%%", width=80,
             help="Share of scan runs since the device was first seen in which it answered."),
     },
 )

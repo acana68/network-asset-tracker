@@ -1,4 +1,5 @@
-"""Discord alerts for new devices.
+"""Discord alerts: new devices, watched devices going offline or coming back,
+and scans that look unreliable.
 
 The webhook URL is read from the DISCORD_WEBHOOK_URL environment variable so
 it never ends up in the code or the repo. Anyone with the URL can post to
@@ -11,6 +12,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 ENV_VAR = "DISCORD_WEBHOOK_URL"
 MAX_LEN = 2000  # Discord's limit per message
@@ -50,7 +52,44 @@ def format_devices(devices):
     header = f"**[!] {len(devices)} new device(s) on the network**"
     lines = [f"{d['mac']}  {d['ip']:<15}  {(d.get('vendor') or '-')[:25]:<25}  {d.get('device_type') or '-'}"
              for d in devices]
+    return _chunked(header, lines)
 
+
+def _duration(delta):
+    minutes = int(delta.total_seconds() // 60)
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{days}d {hours}h" if days else f"{hours}h {minutes:02d}m"
+
+
+def status_line(c):
+    """One line for a watched device that went offline or came back (see status.refresh)."""
+    head = f"{'OFFLINE' if c['status'] == 'offline' else 'ONLINE':<8} {c['name'][:24]:<24}  {c['mac']}  {c['ip'] or '-':<15}"
+    if c["status"] == "offline":
+        return f"{head}  last seen {datetime.fromisoformat(c['last_seen']):%b %d %H:%M}"
+    return head + (f"  back after {_duration(c['gap'])}" if c.get("gap") else "  back online")
+
+
+def format_status_changes(changes):
+    gone = sum(c["status"] == "offline" for c in changes)
+    parts = []
+    if gone:
+        parts.append(f"{gone} went offline")
+    if len(changes) - gone:
+        parts.append(f"{len(changes) - gone} back online")
+    header = f"**[!] Watched devices: {', '.join(parts)}**"
+    return _chunked(header, [status_line(c) for c in changes])
+
+
+def unreliable_scan_message(subnet, found, typical):
+    devices = "device" if found == 1 else "devices"
+    return (f"**[!] Scan of {subnet} found {found} {devices} (usually ~{round(typical)}).** "
+            "Possible connectivity issue on the scanning machine. "
+            "No devices on this subnet will be marked offline until scans look normal again.")
+
+
+def _chunked(header, lines):
+    """Header plus lines in code blocks, split to stay under Discord's length limit."""
     messages, chunk = [], []
     for line in lines:
         # +8 for the ``` fences and newlines, + header on the first message
@@ -74,4 +113,20 @@ def send_new_devices(devices):
         return False
     for message in format_devices(devices):
         post(message)
+    return True
+
+
+def send_status_changes(changes):
+    """Alert about watched devices going offline or coming back. False if no webhook is set."""
+    if not changes or not webhook_url():
+        return False
+    for message in format_status_changes(changes):
+        post(message)
+    return True
+
+
+def send_unreliable_scan(subnet, found, typical):
+    if not webhook_url():
+        return False
+    post(unreliable_scan_message(subnet, found, typical))
     return True
